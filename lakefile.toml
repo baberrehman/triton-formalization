@@ -1,0 +1,9 @@
+name = "TAS"
+version = "0.1.0"
+defaultTargets = ["TAS", "Triton"]
+
+[[lean_lib]]
+name = "TAS"
+
+[[lean_lib]]
+name = "Triton"
