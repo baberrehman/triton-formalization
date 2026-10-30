@@ -1,0 +1,969 @@
+\documentclass[a4paper,UKenglish,anonymous,cleveref,autoref]{lipics-v2021}
+
+\bibliographystyle{plainurl}
+
+\title{Mechanized Type Safety for a Fragment of Triton}
+\titlerunning{Mechanized Type Safety for a Fragment of Triton}
+
+\author{Anonymous}{Anonymous}{}{}{}
+\authorrunning{Anonymous}
+\Copyright{Anonymous}
+
+\ccsdesc[500]{Software and its engineering~Formal language definitions}
+\ccsdesc[300]{Theory of computation~Operational semantics}
+\ccsdesc[100]{Software and its engineering~Compilers}
+
+\keywords{interactive theorem proving, Lean, type safety, operational semantics, Triton, GPU kernels}
+
+\EventEditors{To be completed by the editors}
+\EventNoEds{1}
+\EventLongTitle{17th International Conference on Interactive Theorem Proving (ITP 2026)}
+\EventShortTitle{ITP 2026}
+\EventAcronym{ITP}
+\EventYear{2026}
+\EventDate{July 26--29, 2026}
+\EventLocation{Lisbon, Portugal}
+\EventLogo{}
+\SeriesVolume{0}
+\ArticleNo{0}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Triton is a tiled kernel language whose Python front end rejects ill-typed blocks before any device code is emitted.
+This paper presents two Lean~4 developments of that front end.
+The first is a small-step semantics of the \texttt{tl.*} surface: dtypes, rank, broadcast, boolean masks, and scalar conditions on \texttt{if}.
+The second, TAS, is a core calculus of the cube and vector fragment used by Triton-Ascend: a register is born in one core, a buffer lives in one memory space, and a copy is legal only for a stated list of directions.
+Both developments prove progress, preservation, and type safety.
+There is no \texttt{sorry}.
+The integer stored in a value is a carrier, not a tensor element; there is no heap; an unmasked load is not a proof of an in-bounds address; and \texttt{mmad} does not multiply matrices.
+A separate birth-core walk, transcribed from the Python scope checker, agrees with TAS on the register programs and diverges when a scalar is assigned inside a core.
+Running the Python checkers on the same examples shows two further splits: \texttt{arange} of a non-power-of-two length, which Python rejects and the calculus accepts, and a non-boolean mask on \texttt{load} and \texttt{atomic\_add}, which the calculus rejects and \texttt{semantic.py} turns into an illegal \texttt{tt.load} or \texttt{tt.atomic\_rmw}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+A Triton kernel is a Python function whose tensor operations are checked, then lowered through MLIR to a device binary~\cite{tillet2019triton,lattner2021mlir}.
+The checks that run before lowering decide dtype, rank, broadcast, and, for a masked memory operation, whether the mask is a predicate.
+On Ascend, a second family of checks decides which core a name was born in and which copy directions a mixed cube-then-vector kernel may use.
+Both families are ordinary Python.
+A change to either checker can accept a program the dialect will later reject, or accept a copy whose core does not match the scope the programmer wrote.
+
+This paper is a mechanization of those two families, not a semantics of Python, of TTIR, or of the downstream HIVM pipeline.
+The artifact is a Lake package with two libraries, compiled with Lean~4.19.0~\cite{demoura2021lean}.
+Every statement below that is called a theorem is a \texttt{theorem} in that package, and \texttt{lake build} closes it.
+
+The metatheory is the syntactic type-safety argument of Wright and Felleisen~\cite{wright1994syntactic,pierce2002tapl}.
+A typed expression is a value or takes a step, and the successor has the same type.
+A typed command is \texttt{skip} or takes a step, and the successor is typed at the same result context.
+Type safety lifts the one-step fact across the reflexive-transitive closure.
+The argument is not a compiler-correctness theorem in the sense of CompCert~\cite{leroy2009compcert}: the step relation does not emit MLIR, and the integer payload is not given an IEEE interpretation.
+
+The development makes three claims, each tied to a file.
+\begin{enumerate}
+\item \textbf{Triton.}
+\texttt{Triton/Typing.lean} and \texttt{Triton/Step.lean} define a computable type system and a deterministic small-step relation for the \texttt{tl.*} checks.
+\texttt{Triton/Safety.lean} proves \texttt{expr\_progress}, \texttt{expr\_preservation}, \texttt{progress}, \texttt{preservation}, and \texttt{type\_safety}.
+\item \textbf{TAS.}
+\texttt{TAS/} is the cube and vector calculus.
+Besides the same safety triple, it proves that a typed copy obeys the direction table and that a typed \texttt{mmad} is a cube operation on L1, L1, and L0C.
+\item \textbf{The link.}
+\texttt{TAS/ScopeLink.lean} transcribes the birth-core walk of \texttt{scope\_check.py}.
+It agrees with TAS on five programs taken from the mixed-kernel examples, and a one-line program separates the two: a scalar assigned inside cube is still a scalar for TAS, and the Python walk records it as a cube birth.
+\texttt{correspondence/check\_link.py} runs the real checkers.
+Section~\ref{sec:gaps} records where they disagree and where the disagreement builds an operation the dialect verifier rejects.
+\end{enumerate}
+
+The rest of the paper presents the Triton language (\cref{sec:triton-syn,sec:triton-ty,sec:triton-step,sec:triton-safe}), then TAS (\cref{sec:tas,sec:tas-safe}), then the correspondence and the programs the model rejects (\cref{sec:link,sec:gaps}).
+\Cref{sec:bounds} states the bounds of the proof in the same terms as the theorems.
+\Cref{sec:related} compares the development with other mechanized languages and with GPU kernel verifiers.
+
+\section{The Triton fragment}
+\label{sec:triton-syn}
+
+Names are natural numbers.
+A context and an environment are association lists; \texttt{lookup} returns the first match.
+A shape is a list of natural numbers.
+The empty shape is a scalar: its number of elements is \(1\), and otherwise the number of elements is the product of the extents.
+The constant \texttt{maxNumel} is \(1\,048\,576\), the same bound as \texttt{TRITON\_MAX\_TENSOR\_NUMEL}.
+
+\subsection{Dtypes and types}
+
+The dtype set is the one the front end names: \texttt{bool}, the signed and unsigned integers through 64 bits, the pointer-sized integer \texttt{pi32}, and the floating encodings \texttt{f16}, \texttt{bf16}, \texttt{f32}, \texttt{f64}, and the \texttt{f8*} formats.
+Three predicates partition that set for the operator rules.
+\texttt{isFloat} holds of the floating encodings.
+\texttt{isInt} holds of the integer encodings, including \texttt{bool}.
+\texttt{isNumeric} holds of the integers other than \texttt{bool}, and of the floating encodings.
+A boolean is therefore a legal mask and a legal comparison result, and it is not a legal operand of addition.
+
+A type is one of
+\[
+\begin{aligned}
+\tau \;::=\;& \mathsf{scalar}\;d
+\mid \mathsf{tensor}\;d\;s
+\mid \mathsf{ptr}\;d
+\mid \mathsf{ptrs}\;d\;s
+\mid \mathsf{blockPtr}\;d\;b \\
+&\mid \mathsf{tdesc}\;d\;b
+\mid \mathsf{pair}\;\tau_1\;\tau_2
+\end{aligned}
+\]
+where \(d\) is a dtype, \(s\) and \(b\) are shapes, and a block shape \(b\) is the shape carried by a block pointer or a tensor descriptor.
+A value repeats the same tags and adds one integer.
+An address is a natural number stored as that integer.
+\texttt{valTy} forgets the integer.
+\texttt{pack} rebuilds a value of a given type from an integer.
+The equation that later makes a value redex preserve its type is proved by induction on the type:
+\begin{theorem}[\texttt{valTy\_pack}]
+For every type \(t\) and every integer \(n\), \(\mathsf{valTy}(\mathsf{pack}\;t\;n) = t\).
+\end{theorem}
+
+Scalars are the empty shape, not a separate rank-zero tensor.
+\texttt{asTensor} sends a dtype and the empty shape to a scalar, and every other shape to a tensor.
+This matches the front end, which forbids a block type of rank zero.
+
+\subsection{Broadcast}
+
+Broadcast is right-aligned, as in \texttt{broadcast\_impl}.
+
+\begin{definition}[Right-aligned broadcast]
+\label{def:bcast}
+Padding on the left and matching one axis are
+\[
+\begin{aligned}
+\mathsf{pad}(s, n) &= 1^{n}\,{\cdot}\,s
+&&\text{when } n \ge 0, \\
+\mathsf{axis}(a, b) &=
+\begin{cases}
+\mathsf{some}\;a & \text{if } a = b \text{ or } b = 1, \\
+\mathsf{some}\;b & \text{if } a = 1, \\
+\mathsf{none} & \text{otherwise.}
+\end{cases}
+\end{aligned}
+\]
+For shapes \(s\) and \(t\), let \(n\) be the maximum of their lengths, and let \(s'\) and \(t'\) be the two shapes padded to length \(n\).
+Broadcast succeeds with the list of \(\mathsf{axis}(s'_i, t'_i)\) when every axis succeeds, and fails when any axis fails.
+The empty shape is a scalar.
+It pads to a list of ones and therefore broadcasts with every tensor of positive extents.
+\end{definition}
+
+\texttt{broadcastVal} applies \cref{def:bcast} to the shapes of two types and rebuilds a type of their shared dtype when the dtypes agree.
+\texttt{broadcast3} iterates the same operation.
+A failure of either function is \texttt{none} in every operator that mentions it.
+
+Two consequences are used everywhere below.
+The result of a binary operator has one dtype, the shared dtype of the operands after broadcast, and one shape, the broadcast shape.
+A shift does not promote: the right operand must already have the left operand's dtype.
+There is no rank cap at \(8\).
+A program of rank \(9\) whose number of elements is within \texttt{maxNumel} is well typed here.
+
+\subsection{Expressions and commands}
+
+\texttt{constexpr} bounds, block shapes, and axes are natural-number arguments of the syntax.
+They are not runtime values, and the step relation does not reduce them.
+Host-side target queries, \texttt{PropagateNan}, and Gluon layouts are outside the syntax.
+
+Expressions are variables, values, \texttt{program\_id}, \texttt{num\_programs}, \texttt{arange}, \texttt{full}, \texttt{zeros}, and unary, binary, and ternary operator applications.
+Commands are \texttt{skip}, assignment, sequencing, a block, a conditional, a bounded loop, stores, an atomic read-modify-write, compare-and-swap, a barrier, asserts, and prints.
+The operator constructors are grouped by arity so that the safety proof cases on the arity once.
+\Cref{tab:ops} is the correspondence with the Python names.
+Each row is one family of constructors; the typing function of the family depends only on the constructor and the operand types.
+
+\begin{table}[t]
+\caption{Operator families and the \texttt{tl.*} names they cover.
+\texttt{Float1} is \texttt{exp}, \texttt{exp2}, \texttt{log}, \texttt{log2}, \texttt{cos}, \texttt{sin}, \texttt{sqrt}, \texttt{sqrt\_rn}, \texttt{rsqrt}, \texttt{erf}, \texttt{floor}, \texttt{ceil}, and \texttt{sigmoid}.
+\texttt{Num1} is \texttt{abs} and \texttt{neg}.
+There is no \texttt{umin} in the public list.}
+\label{tab:ops}
+\begin{tabular}{@{}ll@{}}
+\hline
+Family & \texttt{tl} names \\
+\hline
+\texttt{Float1}, \texttt{Num1} & unary arithmetic \\
+\texttt{cast} & dtype change, shape kept \\
+\texttt{trans}, \texttt{permute} & transpose; a permutation of the rank \\
+\texttt{reshape}, \texttt{view} & equal number of elements, at most \texttt{maxNumel} \\
+\texttt{Arith2} & \texttt{add}, \texttt{sub}, \texttt{mul}, \texttt{fdiv}, \texttt{div\_rn}, \texttt{umulhi}, \\
+& \texttt{maximum}, \texttt{minimum}, \texttt{cdiv} \\
+\texttt{Bit2} & \texttt{and}, \texttt{or}, \texttt{xor}, \texttt{shl}, \texttt{shr} \\
+\texttt{CmpOp} & six comparisons; result \texttt{bool} of the broadcast shape \\
+\texttt{ReduceOp} & \texttt{sum}, \texttt{max}, \texttt{min}, \texttt{xor\_sum}, \texttt{reduce\_or}; \\
+& \texttt{argmax} and \texttt{argmin} return a pair \\
+\texttt{ScanOp} & \texttt{cumsum}, \texttt{cumprod}, \texttt{associative\_scan} \\
+\texttt{dot} & rank-2 \([M,K]\times[K,N]\), result \([M,N]\) \\
+\texttt{where\_}, \texttt{fma}, \texttt{clamp} & \texttt{where}; three numeric operands \\
+\texttt{load}, \texttt{loadMask} & pointer shape; mask is \texttt{bool} \\
+\hline
+\end{tabular}
+\end{table}
+
+\texttt{dotScaled} takes the same \([M,K]\times[K,N]\) operands and a third argument that is a pair of tensors of any shape.
+That pair is not the hardware scale layout.
+\texttt{view} uses the same rule as \texttt{reshape} and does not check contiguity.
+\texttt{cdiv} is admitted on tensors by the broadcast rule, not only on scalar \texttt{constexpr} values.
+An inline or external elementwise assembly operator may change the dtype and keeps the shape; the external body is not given a semantics.
+
+\subsection{Contexts}
+
+\texttt{update} replaces the first binding of a name, or appends the name when it is new.
+Reassigning a name to the type it already has therefore leaves the context list unchanged.
+The environment does not have this property.
+Assignment of a value conses a binding, and \texttt{lookup} hides the older one.
+The modelling relation allows the extra binding:
+\[
+\mathsf{models}\;\mathit{env}\;\Gamma
+\;\equiv\;
+\forall x,\tau.\;
+\mathsf{lookup}\;\Gamma\;x = \mathsf{some}\;\tau
+\rightarrow
+\exists v.\;
+\mathsf{lookup}\;\mathit{env}\;x = \mathsf{some}\;v
+\;\wedge\;
+\mathsf{valTy}\;v = \tau.
+\]
+An environment may contain names the context does not mention.
+This is the fact a loop reassignment needs.
+The context list stays the same because \texttt{update} is in place, while the environment gains a new head of the same type, and \texttt{models} still holds by \texttt{models\_assign}.
+
+A configuration is six natural numbers: program identifiers and grid sizes on three axes.
+\texttt{pid} and \texttt{nprog} read axis \(0\), axis \(1\), or else axis \(2\).
+The step relation is indexed by one fixed configuration.
+Identifiers do not change during execution.
+
+\section{The Triton type system}
+\label{sec:triton-ty}
+
+Inference and checking are computable functions into \texttt{Option}.
+Failure is \texttt{none}.
+There is no constraint solver and no elaboration monad.
+A program that the functions accept is accepted by \texttt{native\_decide} in \texttt{Triton/Examples.lean}; a program they reject is a closed equation to \texttt{none}.
+
+\subsection{Expressions}
+
+A value has its \texttt{valTy}.
+A variable has its context binding, if any.
+\texttt{program\_id} and \texttt{num\_programs} have type \(\mathsf{scalar}\;\mathsf{i32}\) when the axis is \(0\), \(1\), or \(2\), and fail otherwise.
+\texttt{arange} from \(\mathit{start}\) to \(\mathit{finish}\) has type \(\mathsf{tensor}\;\mathsf{i32}\;[\mathit{finish}-\mathit{start}]\) when \(\mathit{start} \le \mathit{finish}\) and the length is at most \texttt{maxNumel}.
+The length is not required to be a power of two.
+\texttt{full} and \texttt{zeros} of a shape \(s\) have type \(\mathsf{tensor}\;d\;s\) when the number of elements of \(s\) is within the same bound.
+
+Unary, binary, and ternary rules share one shape.
+The interesting side conditions are the ones that are also step conditions, so they are stated in full.
+
+\begin{definition}[Masks and the other value]
+\label{def:mask}
+\(\mathsf{maskOk}(\tau_r, \tau_m)\) holds in three cases: both types are scalar and the mask is \texttt{bool}; the result is a tensor and the mask is a scalar \texttt{bool}; or both are tensors, the mask dtype is \texttt{bool}, and the broadcast of the mask shape onto the result shape is the result shape.
+\(\mathsf{otherOk}(\tau_r, \tau_o)\) holds when broadcasting the other value onto the result yields the result type.
+\end{definition}
+
+A masked load is typed only when the pointer has a load result \(\tau_r\) (a scalar pointer yields a scalar, a pointer tensor yields a tensor of that shape, a block pointer yields a tensor of the block shape, each subject to \texttt{maxNumel}) and both \(\mathsf{maskOk}(\tau_r, \tau_m)\) and \(\mathsf{otherOk}(\tau_r, \tau_o)\) hold.
+The result is \(\tau_r\).
+An unmasked load has the same result and no mask obligation.
+\texttt{where} requires a \texttt{bool} condition, scalar or tensor, broadcasting onto the common type of the two branches.
+A non-boolean condition is \texttt{none}.
+
+Dot is the rank-2 rule used by the examples:
+\[
+\frac{
+d_1 = d_2
+\quad
+k = k_2
+\quad
+\mathsf{isNumeric}\;d_1
+\quad
+\mathsf{numel}\;[m,n] \le \mathsf{maxNumel}
+}{
+\mathsf{dot}\;:\;
+\mathsf{tensor}\;d_1\;[m,k]
+\times
+\mathsf{tensor}\;d_2\;[k_2,n]
+\;\Rightarrow\;
+\mathsf{tensor}\;d_1\;[m,n]
+}
+\]
+Anything else, including a pair of shapes \([32,16]\) and \([32,16]\), is \texttt{none}.
+The contracting dimensions are the last of the left operand and the second-to-last of the right.
+The rule does not look at a minimum tile size and does not interpret the payloads as a product.
+
+Comparisons produce \texttt{bool} of the broadcast shape, on numeric dtypes.
+Bitwise \texttt{and}, \texttt{or}, and \texttt{xor} admit an integer dtype or \texttt{bool}.
+Shifts admit an integer dtype and, as noted above, require equal dtypes.
+Addition, subtraction, multiplication, minimum, and maximum admit a numeric dtype.
+Division admits a float.
+\texttt{cdiv} and \texttt{umulhi} admit an integer.
+Reductions along an in-range axis keep a numeric dtype, and \texttt{argmax} returns a pair of the reduced value and an \(\mathsf{i32}\) index.
+
+\subsection{Commands}
+
+Checking a command returns the context after the command.
+\begin{itemize}
+\item \texttt{skip}, a barrier, a store, and a print of a typed expression return the incoming context.
+A store must satisfy \texttt{storeOk}: the value dtype matches the pointer pointee, and the value shape broadcasts onto the pointer shape.
+A block pointer or a descriptor is stored with a tensor of the block shape.
+A masked store also requires \(\mathsf{maskOk}\) against the load result of the pointer.
+A descriptor store requires \(\mathsf{i32}\) offsets of shape \([\mathsf{rank}]\).
+\item Assignment updates the context at the type of the expression.
+\item Sequencing checks the second command in the context returned by the first.
+\item A block checks as its body.
+An assignment inside a block is visible after the block.
+This is required for preservation, and it is stated again with the operational rule.
+\item A conditional requires the condition to be \(\mathsf{scalar}\;\mathsf{bool}\) and the two branches to return equal contexts.
+The result is that shared context.
+A tensor condition is rejected; the surface language writes that program with \texttt{where}.
+\item An atomic binds the load result of the pointer, after \texttt{storeOk} accepts the value.
+Compare-and-swap binds the same result when the comparand and the new value both have that type.
+\item An assert or an \texttt{assume} requires \(\mathsf{scalar}\;\mathsf{bool}\).
+\end{itemize}
+
+The loop rule is the one a reader should not confuse with the compiler.
+\begin{definition}[Context-stable loop]
+\label{def:loop}
+\(\mathsf{check}\;\Gamma\;(\mathsf{loop}\;n\;\mathit{body})\) returns \(\Gamma\) when \(\mathsf{check}\;\Gamma\;\mathit{body}\) returns a context \(\Gamma'\) and \(\Gamma' = \Gamma\).
+Otherwise it returns \texttt{none}.
+The bound \(n\) is not inspected.
+\end{definition}
+Because \texttt{update} replaces a binding in place, a body may assign a name that is already in \(\Gamma\), at the same type, and the context list is unchanged.
+A body that assigns a fresh name grows the list, the equality fails, and the loop is rejected.
+\Cref{def:loop} is a property of this model.
+It is not a claim that Triton rejects a fresh assignment inside \texttt{range}.
+The model needs it because the result context of a loop is part of the type-safety statement: every iteration is checked at the same \(\Gamma\), so the result context of the original command can be the result context of every successor.
+
+\subsection{Examples decided by computation}
+
+\texttt{native\_decide} closes the following equations.
+Names \(x\) and \(y\) are scalar \texttt{f32} pointers.
+\begin{itemize}
+\item \texttt{vec\_add\_typed}.
+\(\mathit{offs} = \mathsf{arange}(0,128)\), a load through \(x + \mathit{offs}\), and a store of \(\mathit{xv} + \mathsf{full}([128], 1)\) through \(y + \mathit{offs}\), all checked from the two pointers.
+\item \texttt{bad\_mask\_rejected}.
+A masked load whose mask and \texttt{other} are \texttt{f32} tensors of length \(128\) is \texttt{none}.
+\item \texttt{tensor\_if\_rejected}.
+A conditional on \(\mathsf{arange}(0,4)\) is \texttt{none}.
+\item \texttt{dot\_rejected} and \texttt{dot\_typed}.
+Dot of \([32,16]\) with \([32,16]\) is \texttt{none}.
+Dot of \([32,16]\) with \([16,8]\) is \(\mathsf{tensor}\;\mathsf{f32}\;[32,8]\).
+\item \texttt{program\_id\_typed} and \texttt{program\_id\_rejected}.
+Axis \(0\) is \(\mathsf{scalar}\;\mathsf{i32}\).
+Axis \(3\) is \texttt{none}.
+\item \texttt{loop\_skip\_typed}, \texttt{loop\_fresh\_rejected}, \texttt{loop\_reassign\_typed}.
+A loop of \texttt{skip} keeps the context.
+A loop that assigns \(\mathit{offs}\) when \(\mathit{offs}\) is not yet in scope is \texttt{none}.
+The same assignment, from a context that already contains \(\mathit{offs}\) at \(\mathsf{tensor}\;\mathsf{i32}\;[128]\), is accepted.
+\item \texttt{arange\_non\_pow2\_typed}.
+\(\mathsf{arange}(0,3)\) is \(\mathsf{tensor}\;\mathsf{i32}\;[3]\).
+\end{itemize}
+
+The typing derivation of the vector add is short enough to read off the rules.
+From \(\Gamma = [x : \mathsf{ptr}\;\mathsf{f32},\; y : \mathsf{ptr}\;\mathsf{f32}]\),
+\(\mathsf{arange}(0,128)\) has type \(\mathsf{tensor}\;\mathsf{i32}\;[128]\), and assignment produces \(\Gamma_1 = \mathsf{update}\;\Gamma\;\mathit{offs}\;\mathsf{tensor}\;\mathsf{i32}\;[128]\).
+Pointer offset of a scalar pointer by that tensor has type \(\mathsf{ptrs}\;\mathsf{f32}\;[128]\), and an unmasked load of it has type \(\mathsf{tensor}\;\mathsf{f32}\;[128]\).
+Assignment of the load produces \(\Gamma_2\).
+The stored value is an \texttt{f32} tensor of length \(128\) added to a splat of the same shape, still \(\mathsf{tensor}\;\mathsf{f32}\;[128]\).
+\texttt{storeOk} accepts a pointer tensor of that shape together with that value, and the store returns \(\Gamma_2\).
+The masked variant with an \texttt{f32} mask fails at \cref{def:mask} and nowhere else: the pointer and the \texttt{other} value are well typed.
+
+\section{Operational semantics}
+\label{sec:triton-step}
+
+\texttt{stepE} steps an expression and does not change the environment.
+\texttt{step} steps a command and may cons a binding.
+Both are deterministic and partial.
+A stuck configuration is \texttt{none}.
+\texttt{Steps} is the reflexive-transitive closure at one fixed configuration.
+
+A variable loads the value \texttt{models} provides.
+\texttt{program\_id}, \texttt{num\_programs}, \texttt{arange}, \texttt{full}, and \texttt{zeros} step to a value under the same condition that types them.
+The integer chosen for \texttt{arange} and for a splat is a carrier: the development uses \(0\) for a range and the requested constant for \texttt{full}.
+Nothing in the safety proof reads that integer as a lane index.
+
+A unary, binary, or ternary expression steps its children from the left, then, when every child is a value, packs a result:
+\begin{equation}
+\label{eq:eval}
+\begin{aligned}
+\mathsf{evalUnary}\;\mathit{op}\;v
+&= \mathsf{pack}\;t\;(\mathsf{payload}\;v)
+&&\text{where }\mathsf{unaryTy}\;\mathit{op}\;(\mathsf{valTy}\;v) = \mathsf{some}\;t, \\
+\mathsf{evalBinary}\;\mathit{op}\;v_1\;v_2
+&= \mathsf{pack}\;t\;(n_1 + n_2)
+&&\text{where }\mathsf{binaryTy}\;\mathit{op}\;(\mathsf{valTy}\;v_1)\;(\mathsf{valTy}\;v_2) = \mathsf{some}\;t.
+\end{aligned}
+\end{equation}
+The ternary case adds the three payloads.
+If the typing function returns \texttt{none}, evaluation returns \texttt{none}.
+\Cref{eq:eval} is why a value redex preserves its type: the successor is \texttt{pack} of the type the typing function already returned, and \texttt{valTy\_pack} forgets the integer.
+The safety proof does not case on every operator.
+It cases on arity, applies the specification of \texttt{evalUnary}, \texttt{evalBinary}, or \texttt{evalTernary}, and uses \texttt{valTy\_pack}.
+The arithmetic in \cref{eq:eval} is integer addition of carriers.
+It is not IEEE addition, and the proof does not claim that it is.
+
+Commands:
+\begin{itemize}
+\item Assignment of a value conses the binding and becomes \texttt{skip}.
+Otherwise the expression steps under the assignment.
+\item \(\mathsf{seq}\;\mathsf{skip}\;c\) becomes \(c\).
+Otherwise the first command steps under the sequence.
+\item A block of \texttt{skip} becomes \texttt{skip}.
+Otherwise the body steps under the block.
+\item A conditional of a scalar boolean selects the corresponding arm.
+\(\mathsf{stepBool}\) reads a scalar \texttt{bool} value as false at payload \(0\) and true otherwise.
+A non-value condition steps.
+\item \(\mathsf{loop}\;0\;\mathit{body}\) becomes \texttt{skip}.
+\(\mathsf{loop}\;(n{+}1)\;\mathit{body}\) becomes \(\mathsf{seq}\;\mathit{body}\;(\mathsf{loop}\;n\;\mathit{body})\).
+The body is not wrapped in a block.
+Wrapping it would hide assignments from the next iteration and would make preservation false for the context-stable rule, because the block would have to return the outer context while the body returned a different one.
+With the rule as written, a reassignment escapes, which is what \cref{def:loop} allows, and a fresh assignment has already been rejected by checking.
+\item A store of values becomes \texttt{skip} when \texttt{storeOk} holds, and does not write a heap.
+A masked store becomes \texttt{skip} when \texttt{storeOk} and \texttt{maskOk} both hold.
+There is no heap.
+The same \texttt{storeOk} and \texttt{maskOk} are the typing conditions, so a typed store of values is never stuck on the side condition.
+\item An atomic of values conses \(\mathsf{pack}\;\tau_r\;(\mathsf{payload}\;v_p)\) and becomes \texttt{skip}, where \(\tau_r\) is the load result of the pointer.
+Compare-and-swap conses a pack of the comparand's payload at that type.
+The pointer payload is the carrier.
+No memory cell changes.
+\item A barrier becomes \texttt{skip}.
+An assert of a scalar \texttt{bool} becomes \texttt{skip}, whether the payload is \(0\) or not.
+The development does not model a failed assertion as a stuck state.
+A print of a value becomes \texttt{skip}.
+\end{itemize}
+
+An unmasked load of a well-typed pointer value always steps, by the unary case of \cref{eq:eval}.
+That fact is progress for the load.
+It is not spatial memory safety.
+A masked load of a well-typed boolean mask also steps; a masked load whose mask is \texttt{f32} is not well typed, so progress does not apply to it.
+
+\section{Type safety for Triton}
+\label{sec:triton-safe}
+
+The statements are the ones \texttt{Triton/Safety.lean} closes.
+Environments and contexts are related by \(\mathsf{models}\).
+
+\begin{theorem}[\texttt{expr\_progress}]
+\label{thm:eprog}
+If \(\mathsf{models}\;\mathit{env}\;\Gamma\) and \(\mathsf{infer}\;\Gamma\;e = \mathsf{some}\;\tau\), then either \(e\) is a value or there exists \(e'\) with \(\mathsf{stepE}\;\mathit{cfg}\;\mathit{env}\;e = \mathsf{some}\;e'\).
+\end{theorem}
+
+\begin{theorem}[\texttt{expr\_preservation}]
+\label{thm:epres}
+Assume \(\mathsf{models}\;\mathit{env}\;\Gamma\) and \(\mathsf{infer}\;\Gamma\;e = \mathsf{some}\;\tau\), and assume \(\mathsf{stepE}\;\mathit{cfg}\;\mathit{env}\;e = \mathsf{some}\;e'\).
+Then \(\mathsf{infer}\;\Gamma\;e' = \mathsf{some}\;\tau\), and the environment is unchanged.
+\end{theorem}
+
+\begin{theorem}[\texttt{progress}]
+\label{thm:prog}
+If \(\mathsf{models}\;\mathit{env}\;\Gamma\) and \(\mathsf{check}\;\Gamma\;c = \mathsf{some}\;\Gamma_{\mathrm{out}}\), then either \(c\) is \texttt{skip} or there exist \(\mathit{env}'\) and \(c'\) with \(\mathsf{step}\;\mathit{cfg}\;\mathit{env}\;c = \mathsf{some}\;(\mathit{env}', c')\).
+\end{theorem}
+
+\begin{theorem}[\texttt{preservation}]
+\label{thm:pres}
+If \(\mathsf{models}\;\mathit{env}\;\Gamma\), \(\mathsf{check}\;\Gamma\;c = \mathsf{some}\;\Gamma_{\mathrm{out}}\), and \(\mathsf{step}\;\mathit{cfg}\;\mathit{env}\;c = \mathsf{some}\;(\mathit{env}', c')\), then there exists \(\Gamma'\) such that \(\mathsf{models}\;\mathit{env}'\;\Gamma'\) and \(\mathsf{check}\;\Gamma'\;c' = \mathsf{some}\;\Gamma_{\mathrm{out}}\).
+\end{theorem}
+
+\begin{theorem}[\texttt{type\_safety}]
+\label{thm:safe}
+If \(\mathsf{models}\;\mathit{env}\;\Gamma\), \(\mathsf{check}\;\Gamma\;c = \mathsf{some}\;\Gamma_{\mathrm{out}}\), and \(\mathsf{Steps}\) relates \((\mathit{env}, c)\) to \((\mathit{env}_2, c_2)\), then there exists \(\Gamma_2\) such that \(\mathsf{models}\;\mathit{env}_2\;\Gamma_2\) and \(\mathsf{check}\;\Gamma_2\;c_2 = \mathsf{some}\;\Gamma_{\mathrm{out}}\).
+\end{theorem}
+
+\Cref{thm:safe} is induction on \texttt{Steps}.
+The reflexive case is the assumption.
+The step case is \cref{thm:pres}.
+The result context \(\Gamma_{\mathrm{out}}\) is invariant.
+Intermediate contexts change: an assignment replaces \(\Gamma\) by \(\mathsf{update}\;\Gamma\;x\;\tau\), and the successor \texttt{skip} is checked at that updated context, still with result \(\Gamma_{\mathrm{out}}\).
+
+\subsection{What the proof has to do}
+\label{sec:proof-work}
+
+\Cref{eq:eval} makes the value-redex case of \cref{thm:epres} an appeal to \texttt{valTy\_pack}.
+The work in the proof is everything else.
+
+Congruence is a family of lemmas in the mathematical sense, written as \texttt{theorem}s: a unary, binary, or ternary expression steps when the active child steps, and the typing of the successor follows by the induction hypothesis together with the operator's typing function.
+Command congruence covers assignment, sequencing, blocks, conditionals, and the left-to-right operands of a store.
+Inversion has to be stated by cases on the command, because a barrier and a finished loop step to a concrete successor with no recursive call.
+A wildcard split on the step equation does not see those constructors.
+
+The side conditions that typing imposes are the side conditions that stepping imposes.
+For a store of values, \texttt{storeOk} is in both definitions, so the progress case is the value branch of \texttt{step} and the preservation case rewrites by that equation.
+The same holds for \texttt{maskOk} on a masked store and for the offset shape on a descriptor store.
+If the step relation had omitted a check that typing performs, a typed term would be stuck and \cref{thm:prog} would be false.
+If it had added a check that typing does not perform, a typed term would step to a successor that checking rejects and \cref{thm:pres} would be false.
+Keeping the two functions in that correspondence is the content of the memory and atomic cases.
+
+Control is the other content.
+A conditional is checked only when both arms return the same context \(\Gamma_{\mathrm{out}}\).
+The step selects one arm and leaves the environment alone, so preservation supplies \(\Gamma' = \Gamma\) and \(\mathsf{check}\;\Gamma\;c_i = \mathsf{some}\;\Gamma_{\mathrm{out}}\).
+A loop of zero steps to \texttt{skip}, and checking \texttt{skip} at \(\Gamma\) returns \(\Gamma\), which is \(\Gamma_{\mathrm{out}}\) by \cref{def:loop}.
+A loop of \(n{+}1\) steps to \(\mathsf{seq}\;\mathit{body}\;(\mathsf{loop}\;n\;\mathit{body})\).
+Context stability gives \(\mathsf{check}\;\Gamma\;\mathit{body} = \mathsf{some}\;\Gamma\).
+The same equality gives \(\mathsf{check}\;\Gamma\;(\mathsf{loop}\;n\;\mathit{body}) = \mathsf{some}\;\Gamma\).
+Sequencing two commands that each return \(\Gamma\) returns \(\Gamma\).
+The result context is unchanged, which is what \cref{thm:pres} asks for.
+A design in which the loop expanded to a block that restored the outer context made this equality false whenever the body assigned, and that design was rejected because preservation failed.
+
+\texttt{models\_assign} is the assignment case.
+Consing a value of type \(\tau\) at name \(x\) preserves \(\mathsf{models}\) at \(\mathsf{update}\;\Gamma\;x\;\tau\), including when the update does not change the list because \(\tau\) was already the binding.
+\texttt{lookup\_update\_same} and \texttt{lookup\_update\_other} are the supporting theorems for that update.
+
+\begin{table}[t]
+\caption{Side conditions that occur both in \texttt{check} and in \texttt{step}.
+Omitting the condition from \texttt{step} makes a typed command stuck.
+Adding a condition that \texttt{check} does not impose makes the successor ill-typed.}
+\label{tab:side}
+\begin{tabular}{@{}lll@{}}
+\hline
+Command & Shared condition & Successor \\
+\hline
+store of values & \texttt{storeOk} & \texttt{skip} \\
+masked store & \texttt{storeOk} and \texttt{maskOk} & \texttt{skip} \\
+descriptor store & offset shape \([\mathsf{rank}]\) & \texttt{skip} \\
+atomic of values & \texttt{storeOk}, load result & cons a pack, \texttt{skip} \\
+compare-and-swap & comparand and value types & cons a pack, \texttt{skip} \\
+conditional & scalar \texttt{bool}, equal arms & the selected arm \\
+loop at \(n{+}1\) & body returns the same \(\Gamma\) & sequence of body and loop \\
+\hline
+\end{tabular}
+\end{table}
+
+An assert is the deliberate exception in that table.
+Checking requires a scalar \texttt{bool}, and stepping to \texttt{skip} does not test the payload.
+A typed assert is therefore not stuck, including when the carrier is \(0\).
+The development records the front-end judgement that the condition is a boolean, and it does not record a trap.
+
+\section{TAS: cores, spaces, and copies}
+\label{sec:tas}
+
+Triton-Ascend adds a second surface, TLA, in which a region is marked \texttt{tla.scope.cube} or \texttt{tla.scope.simd} and data move between global memory (GM), unified buffer (UB), L1, and L0C.
+TAS is a calculus of that fragment.
+It is a separate Lean library.
+It does not include the \texttt{tl.*} operators, and the Triton development does not include cores.
+
+\subsection{Syntax}
+
+There are two cores, vector and cube, and four spaces, GM, UB, L1, and L0C.
+A type is a scalar, a register of a core, or a buffer of a space.
+A value is the same tag plus one integer.
+A buffer is one cell.
+Expressions are values, variables, scalar addition, \texttt{splat} of a scalar to a register of the current core, vector addition of two registers, and a vector load from a UB buffer.
+Commands are \texttt{skip}, assignment, sequencing, a scope, a block, a vector store, a copy, and \texttt{mmad}.
+Source programs use \texttt{scope}.
+The machine uses \texttt{block}: the first step of a scope is the block of the same body, in the same environment.
+
+Names, lookup, and \(\mathsf{models}\) are as in Triton.
+Context update is not.
+TAS update conses a binding, so a later assignment hides an earlier one of the same name.
+TAS has no loop, so it does not need the in-place update of \cref{def:loop}.
+Hiding is what makes \texttt{rebound} well typed: a name born as a cube register is assigned again inside the vector scope, and the new binding is a vector register.
+
+\subsection{The scope and copy rules}
+
+A register of core \(k\) may be read outside either core, and inside \(k\).
+It may not be read inside the other core.
+Scalars and buffers are accepted in every core.
+That is \texttt{tyOk}.
+The register clause is \texttt{regOk}, defined by a match on the two cores rather than by boolean equality, so that the proofs can case on constructors.
+
+\begin{definition}[Copy directions]
+\label{def:copy}
+\(\mathsf{copyOk}(h, s, d)\) holds for exactly five triples:
+cube with GM to L1;
+cube with L0C to UB;
+cube with L0C to GM;
+neither core, with GM to UB;
+neither core, with UB to GM.
+\end{definition}
+
+\texttt{splat} requires an open core and a scalar, and produces a register of that core.
+Vector addition requires an open core and two registers of that core.
+A vector load requires the vector core and a UB buffer, and produces a vector register.
+A vector store requires the vector core, a UB buffer, and a vector register, and leaves the context unchanged.
+\texttt{mmad} requires the cube core, two L1 buffers, and an L0C buffer, and leaves the context unchanged.
+A copy requires \cref{def:copy} and leaves the context unchanged.
+Scope and block both check the body at the core they name.
+The result context of the scope is the result context of the body, so an assignment inside the scope is visible afterwards.
+Buffers allocated outside either scope remain buffers; \texttt{tyOk} does not attach a core to them, and both scopes may name them.
+
+\subsection{Steps}
+
+Expression stepping is the obvious one, guarded by \texttt{tyOk}.
+Two scalar values add their payloads.
+\texttt{splat} of a scalar in core \(k\) becomes a register of \(k\) holding that payload.
+Two registers of the open core add.
+A vector load of a UB cell on the vector core becomes a vector register holding that cell.
+
+Assignment of a value conses the binding.
+A scope steps to the corresponding block.
+A block of \texttt{skip} becomes \texttt{skip}, back at the outer core; otherwise the body steps at the inner core.
+A vector store of a vector register into a UB buffer conses that cell and becomes \texttt{skip}.
+A copy, when \cref{def:copy} accepts the direction, conses the destination buffer with the source cell.
+\texttt{mmad}, when the spaces and the cube core match, becomes \texttt{skip} and does not write the accumulator.
+The integer in the L0C cell is untouched.
+\texttt{mmad} does not multiply matrices, and the safety theorem does not say that it does.
+
+\texttt{Steps} is again the reflexive-transitive closure, now at one fixed outer core.
+Inner cores travel inside \texttt{block}.
+
+\subsection{The mixed kernel}
+
+The running example is the one-cell cut of the mixed kernel in the TLA unit tests.
+Nine names are allocated: GM, L1, and L0C buffers for a cube matmul, a UB buffer, and a GM destination.
+The cube body copies GM to L1 for the two inputs, runs \texttt{mmad} into L0C, and copies L0C to UB.
+The vector body splats a scalar into a register, loads the UB cell, and stores the sum back to UB.
+The program then copies UB to GM outside either scope.
+\texttt{gemm\_bias\_typed} is \texttt{native\_decide} of that program from the outer core.
+The first step is not a copy.
+\texttt{gemm\_bias\_steps\_into\_cube}, proved by \texttt{rfl}, says that the first step replaces \(\mathsf{scope}\;\mathsf{cube}\) by \(\mathsf{block}\;\mathsf{cube}\) and leaves the environment in place.
+
+\begin{definition}[The cube body, one cell at a time]
+\label{def:trace}
+Write the program after that first step as \(\mathsf{seq}\;(\mathsf{block}\;\mathsf{cube}\;\mathit{cubeBody})\;c_{\mathrm{rest}}\), where \(c_{\mathrm{rest}}\) is the vector scope followed by the final UB-to-GM copy.
+\(\mathit{cubeBody}\) is itself a sequence whose first command is \(\mathsf{copy}\;\mathit{aGm}\;\mathit{aL1}\).
+The block rule steps its body, the sequence rule steps its first command, and the copy rule applies because the open core is cube and the spaces are GM and L1, which is the first row of \cref{def:copy}.
+The successor conses the L1 buffer with the integer carried by the GM buffer and replaces the copy by \texttt{skip}.
+The next sequence rule discards that \texttt{skip}.
+The same reasoning copies \(\mathit{bGm}\) to \(\mathit{bL1}\).
+\texttt{mmad} then matches the cube core and the three spaces and becomes \texttt{skip} without consing a new accumulator.
+The L0C-to-UB copy is the second row of \cref{def:copy}; it conses the UB cell and becomes \texttt{skip}.
+When the block body is \texttt{skip}, the block becomes \texttt{skip} and the outer sequence continues at the vector scope.
+The rules of this section fix each successor.
+Progress, applied to a program that \texttt{gemm\_bias\_typed} has accepted, says that none of these configurations is stuck.
+Only the opening step, from \texttt{scope} to \texttt{block}, is stated as its own theorem.
+\end{definition}
+
+Four further programs fix the scope rule.
+\texttt{cross\_scope\_rejected}: a register splatted in cube and read by a vector store is \texttt{none}.
+\texttt{rebound\_typed}: assigning the name again inside the vector scope is accepted.
+\texttt{scalar\_both\_typed}: a scalar assigned outside both cores is readable in each, and the assignments inside the cores bind other names.
+\texttt{nested\_cross\_rejected}: a register born in an outer vector scope is rejected in an inner cube scope.
+
+\section{Type safety for TAS}
+\label{sec:tas-safe}
+
+The safety statements repeat \cref{thm:eprog,thm:epres,thm:prog,thm:pres,thm:safe} with an outer core \(h\) in place of the Triton configuration.
+\texttt{type\_safety} is again induction on \texttt{Steps}, using preservation at each tail.
+The result context is invariant, and the core at which the successor is checked is the same outer core: inner cores are syntax, not a change to the index of \texttt{Steps}.
+
+The inversion theorems are the part that talks about cores rather than about stuck terms.
+
+\begin{theorem}[\texttt{scope\_isolation}]
+If a variable is inferred at core \(k\) with type \(\mathsf{reg}\;k'\), then \(k = k'\).
+\end{theorem}
+
+\begin{theorem}[\texttt{tyOk\_reg}]
+If a register of core \(k'\) is accepted by \texttt{tyOk} at core \(k\), then \(k = k'\).
+\end{theorem}
+
+\begin{theorem}[\texttt{splat\_birth}]
+A typed \texttt{splat} at core \(k\) has type \(\mathsf{reg}\;k\).
+\end{theorem}
+
+\begin{theorem}[\texttt{vld\_requires\_ub}]
+A typed vector load at the vector core reads a UB buffer and has type \(\mathsf{reg}\;\mathsf{vec}\).
+\end{theorem}
+
+\begin{theorem}[\texttt{copy\_respects\_direction}]
+A typed copy satisfies \cref{def:copy}.
+\end{theorem}
+
+\begin{theorem}[\texttt{mmad\_requires\_cube}]
+A typed \texttt{mmad} is checked at the cube core, and its three buffers are L1, L1, and L0C.
+\end{theorem}
+
+\texttt{scope\_isolation} is the reason a cube register cannot be read as a vector register after a step.
+Preservation carries the context that checking produced, and \texttt{tyOk} still refuses the other core.
+The proof of isolation is the definition of \texttt{inferVar}: the variable's binding is accepted by \texttt{tyOk} only when \texttt{tyOk\_reg} forces the cores to agree.
+\texttt{copy\_respects\_direction} and \texttt{mmad\_requires\_cube} are the same kind of argument on \texttt{checkCopy} and \texttt{checkMmad}.
+They are not consequences of progress.
+Progress says a typed copy steps; the inversion theorem says the only copies that are typed are the five directions.
+
+Scalar addition, \texttt{splat}, vector addition, and vector load have the same progress and preservation shape as the Triton operators, with one difference.
+Their evaluation is not defined as \texttt{pack} of a typing function of arbitrary arity.
+Each operator has its own step equation, and preservation cases on it.
+The payloads are still carriers.
+The proof that a vector load returns a vector register uses the UB obligation from typing to know that the value in the environment is a buffer cell, then steps to a register of the vector core holding that cell.
+
+\section{Linking the two checkers}
+\label{sec:link}
+
+The Python scope checker does not use the TAS types.
+It records, for each assigned name, the core that was open at the assignment, and it drops that record when the name is assigned outside either core.
+A use fails only when a core is open and the recorded birth core is the other one.
+Calls such as \texttt{tla.copy} and \texttt{tla.cube.mmad} are uses of their name arguments.
+They do not bind those names.
+
+\texttt{scopeCmd} in \texttt{TAS/ScopeLink.lean} is that walk on TAS commands.
+\texttt{bindName} conses \((x, k)\) inside core \(k\) and erases \(x\) outside either core.
+\texttt{useOk} is the failure condition above.
+A variable is a use.
+A value is not.
+Scalar addition, \texttt{splat}, vector addition, and vector load collect uses.
+A copy or \texttt{mmad} uses its buffer names and does not bind them.
+A scope or a block switches the open core and keeps the resulting birth list, because a binding survives the scope that created it.
+The same survival is what the Python checker does with one shared dictionary.
+
+The walk agrees with TAS checking on the five programs of \cref{sec:tas}.
+Each agreement is one \texttt{native\_decide} theorem.
+\begin{itemize}
+\item \texttt{scope\_gemm\_bias\_accepted} and \texttt{scope\_rebound\_accepted} accept.
+\item \texttt{scope\_scalar\_both\_accepted} accepts the scalar assigned outside either core.
+\item \texttt{scope\_cross\_rejected} and \texttt{scope\_nested\_cross\_rejected} reject.
+\end{itemize}
+One further fact is proved by cases on the two cores, rather than by computation.
+
+\begin{theorem}[\texttt{cross\_core\_read\_scope}, \texttt{cross\_core\_read\_tas}]
+\label{thm:cross}
+Let \(k \neq k'\).
+The scope walk and TAS checking both reject the assignment of variable \(0\) at core \(k\) when the birth list, respectively the context, records \(0\) at core \(k'\).
+The context records a register.
+The birth list records only the core.
+\end{theorem}
+
+\Cref{thm:cross} is the overlap the two analyses actually have: a register born in one core is refused in the other.
+It is not an equivalence of the two acceptance sets.
+
+\begin{theorem}[\texttt{scalar\_inside\_tas\_accepted}, \texttt{scalar\_inside\_scope\_rejected}]
+\label{thm:scalar}
+The program that assigns the scalar \(1\) to \(\mathit{bias}\) inside cube, then reads \(\mathit{bias}\) inside the vector scope, is accepted by TAS checking from the empty context and rejected by the scope walk from the empty birth list.
+\end{theorem}
+
+The TAS derivation is \texttt{tyOk} on a scalar, which ignores the open core, followed by an assignment of that scalar.
+The walk records the assignment as a cube birth because every assignment inside a core is recorded, and the vector use then fails.
+\texttt{correspondence/check\_link.py} loads \texttt{scope\_check.py} by file path and rejects the same Python program.
+It accepts the gemm-shaped kernel, the rebound, and the scalar assigned outside both cores, and it rejects the cross-scope and nested-cross programs.
+The Python copies in that kernel are calls, not assignments, matching the TAS commands.
+
+The same script calls \texttt{TritonSemantic} on the Triton examples.
+Both sides accept \texttt{program\_id(0)} as \texttt{int32} of rank \(0\) and reject axis \(3\).
+Both reject dot of \([32,16]\) with \([32,16]\), and both accept dot of \([32,16]\) with \([16,8]\) at \texttt{f32} of shape \([32,8]\).
+Both accept \(\mathsf{arange}(0,128)\) as \texttt{int32} of length \(128\).
+The script asserts these agreements and asserts the disagreements of the next section.
+Ten tests pass.
+
+\section{Where the model rejects a program the front end accepts}
+\label{sec:gaps}
+
+The correspondence is useful where it is not an equivalence.
+This section lists the programs the calculus rejects and the Python front end accepts, and one program of the opposite shape so that it is not mistaken for the same phenomenon.
+The observations were made by calling \texttt{TritonSemantic} and by reading \texttt{tla/copy.py}, \texttt{tla/cube.py}, and the \texttt{tt.load} and \texttt{tt.atomic\_rmw} declarations.
+The copy observation was not executed as a device kernel.
+
+\subsection{A non-boolean load mask}
+
+\Cref{def:mask} rejects \texttt{badMask}.
+\texttt{\_load\_legacy} does not test that the mask dtype is boolean.
+It broadcasts the mask onto the pointer and passes the mask handle to \texttt{create\_masked\_load}.
+The same file rejects that mask on a store, with the message that the mask must have boolean scalar type.
+A call with an \texttt{f32} mask of length \(128\) returns an \texttt{f32} tensor from \texttt{semantic.load}.
+The operation it inserts has pointer type \(\mathsf{tensor}\langle 128 \times {!}\texttt{tt.ptr}\langle\texttt{f32}\rangle\rangle\), a mask of type \(\mathsf{tensor}\langle 128 \times \texttt{f32}\rangle\), an \texttt{other} operand of that same \texttt{f32} tensor type, and result type \(\mathsf{tensor}\langle 128 \times \texttt{f32}\rangle\).
+The dialect requires the mask operand to be a 1-bit integer or a tensor of 1-bit integers.
+\texttt{module.verify()} fails on operand 1.
+An \texttt{int1} mask of the same shape verifies.
+The kernel compiler reaches that verifier only after the body has been visited, and the exception it raises is a parse error.
+The calculus rejects the program at the same layer as the store check.
+
+\subsection{A non-boolean atomic mask}
+
+\texttt{tt.atomic\_rmw} has the same 1-bit mask operand.
+\texttt{atom\_red\_typechecking\_impl} broadcasts a provided mask and does not test the boolean scalar type.
+\texttt{histogram} in the same file does.
+\texttt{semantic.atomic\_add} of an \texttt{f32} pointer block, an \texttt{f32} value, and an \texttt{f32} mask returns normally and inserts an \texttt{tt.atomic\_rmw} whose third operand is \(\mathsf{tensor}\langle 128\times\texttt{f32}\rangle\).
+Verification fails on that operand.
+The calculus has no separate atomic-mask rule that is weaker than \cref{def:mask}: a masked memory operand is a boolean.
+
+\subsection{\texttt{where} on a non-boolean condition}
+
+The ternary rule for \texttt{where} accepts a \texttt{bool} condition only.
+\texttt{semantic.where} warns and casts the condition to \texttt{int1}.
+An \texttt{f32} condition of length \(128\) therefore produces a warning and an \texttt{f32} result.
+The operation is a cast followed by a select, and verification is not the failure.
+The predicate is whatever that cast does to the float.
+The warning says a later release will reject the call.
+The calculus rejects it in \cref{sec:triton-ty}.
+
+\subsection{A cube copy or \texttt{mmad} in a vector scope}
+
+\Cref{def:copy} ties each direction to the core that is open.
+\cref{thm:cross} is about names; this gap is about operations.
+The Python front end splits the two facts across two checkers, and neither sees both.
+
+The scope walk records births.
+A copy of buffers allocated outside either scope is a use of names with no birth, so it passes in either core.
+\texttt{tla.copy} checks the space pair and not the enclosing \texttt{with}.
+GM to UB emits a load, UB to GM emits a store, GM to L1 emits \texttt{nd2nz}, and an L0C source emits a fixpipe for every destination space.
+\texttt{tla.cube.mmad} checks that its inputs are L1 and its accumulator is L0C.
+It does not check that the call is inside \texttt{tla.scope.cube}.
+
+\texttt{nd2nz} is declared with a cube core trait.
+A GM-to-UB load is inferred as a vector operation.
+The mix-kernel split clones a function into a cube half and a vector half and erases the other core's operations from each half.
+A GM-to-L1 copy written inside the vector scope is a cube operation placed in that scope.
+The front end accepts it.
+The split then drops it from the vector half or leaves it on the cube half, separated from the vector operations it was written next to.
+The same pattern is an \texttt{mmad} inside the vector scope, and a GM-to-UB copy inside the cube scope.
+TAS checking returns \texttt{none} for each of those, by \cref{def:copy} and by \texttt{mmad\_requires\_cube}.
+
+\subsection{Programs that are not this gap}
+
+\(\mathsf{arange}(0,3)\) is accepted by \texttt{arange\_non\_pow2\_typed} and rejected by \texttt{semantic.arange}, which requires a power-of-two length.
+Python is stricter.
+\Cref{thm:scalar} is the other direction: the scope walk rejects a scalar born inside cube, and TAS accepts it.
+A cross-core register read is rejected by both, which is \cref{thm:cross}.
+\texttt{logical\_and} on \texttt{int32} raises a bitcast error in Python and does not build an operation.
+These are differences.
+They are not programs the model catches and the implementation lets through.
+
+\section{Bounds of the guarantee}
+\label{sec:bounds}
+
+\Cref{thm:safe} and its TAS twin say that a configuration reachable from a typed command is typed at the original result context.
+They do not say more than the step relation can support.
+
+The integer in a value is a carrier.
+\Cref{eq:eval} adds carriers.
+Dot does not multiply matrices, and TAS \texttt{mmad} does not write the accumulator.
+A store, a masked store, and a descriptor store become \texttt{skip} without a heap.
+An atomic conses a packed carrier and does not modify a cell.
+There is no theorem about aliasing, data races, or the order of two stores.
+An unmasked load of a typed pointer steps for every payload, including a payload that would be out of bounds in an allocation the model does not have.
+
+The loop rule is \cref{def:loop}.
+A fresh name in a loop is rejected.
+A reassignment at the same type is accepted.
+The bound is not part of the type.
+\texttt{view} does not check contiguity.
+Rank is not capped.
+The scale operands of \texttt{dotScaled} are a pair of tensors of any shape.
+A shift does not promote.
+Libdevice functions other than the \texttt{Float1} list are an assembly operator: the dtype may change, the shape stays, and the body is unchecked.
+\texttt{target\_info} is host-side and is not a device expression.
+
+TAS is one cell per buffer.
+Copy moves that cell in the five directions, and only there.
+A register may be read outside either core, which is \texttt{regOk} at the empty core; the Python walk has no empty-core use of a core-born name that would correspond to a different rule, because a use outside either core is always allowed.
+Pipeline acceptance between Triton-Ascend stages is not a theorem of either library.
+
+The proofs are checked by Lean~4.19.0.
+The package has two libraries and no \texttt{sorry}.
+Example programs are closed by \texttt{native\_decide} or, for the first step of the mixed kernel, by \texttt{rfl}.
+Definitions that return \texttt{Option} are the type system; the safety theorems are about those definitions, not about a second inductive presentation that could drift from them.
+
+\section{The artifact}
+\label{sec:artifact}
+
+The package is one Lake project with two libraries, \texttt{Triton} and \texttt{TAS}, pinned to Lean~4.19.0.
+\texttt{lake build} is the check.
+\Cref{tab:files} is the map from the sections of this paper to the files a reviewer can open.
+Example theorems are closed by \texttt{native\_decide} or by \texttt{rfl}.
+The safety theorems are tactic proofs.
+Nothing is admitted with \texttt{sorry}.
+
+\begin{table}[t]
+\caption{Files and the sections that depend on them.}
+\label{tab:files}
+\begin{tabular}{@{}ll@{}}
+\hline
+File & Role in the paper \\
+\hline
+\texttt{Triton/Basic.lean} & dtypes, broadcast, \texttt{pack}, \texttt{update} \\
+\texttt{Triton/Typing.lean} & \cref{sec:triton-ty}, including \cref{def:mask,def:loop} \\
+\texttt{Triton/Step.lean} & \cref{sec:triton-step}, including \cref{eq:eval} \\
+\texttt{Triton/Safety.lean} & \cref{thm:eprog,thm:epres,thm:prog,thm:pres,thm:safe} \\
+\texttt{Triton/Examples.lean} & the \texttt{native\_decide} programs of \cref{sec:triton-ty} \\
+\texttt{TAS/Basic.lean} & cores, spaces, \cref{def:copy} \\
+\texttt{TAS/Typing.lean}, \texttt{Step.lean} & the TAS rules of \cref{sec:tas} \\
+\texttt{TAS/Safety.lean} & \cref{sec:tas-safe} \\
+\texttt{TAS/Examples.lean} & the mixed kernel and \cref{def:trace} \\
+\texttt{TAS/ScopeLink.lean} & \cref{sec:link}, including \cref{thm:cross,thm:scalar} \\
+\hline
+\end{tabular}
+\end{table}
+
+The Python side of the correspondence is not a Lean definition.
+The script \texttt{check\_link.py} loads \texttt{scope\_check.py} from the Triton-Ascend tree.
+It constructs a \texttt{TritonSemantic} value against that tree's \texttt{libtriton}.
+The ten tests assert the agreements of \cref{sec:link} and the disagreements of \cref{sec:gaps}.
+A test that started to fail would mean the front end and the calculus had moved relative to each other; the Lean theorems would still be theorems about the calculus.
+That split is intentional.
+The calculus is not generated from the Python, and the Python is not extracted from the calculus.
+
+\subsection{The loop case, in detail}
+\label{sec:loop-case}
+
+The loop case is the one that failed under an earlier definition of \texttt{block}, so it is worth spelling out as a calculation rather than as a slogan.
+Fix \(\Gamma\), a body, and a bound \(n{+}1\), and assume
+\[
+\mathsf{check}\;\Gamma\;(\mathsf{loop}\;(n{+}1)\;\mathit{body}) = \mathsf{some}\;\Gamma.
+\]
+\Cref{def:loop} does not inspect the bound, so the same assumption is \(\mathsf{check}\;\Gamma\;\mathit{body} = \mathsf{some}\;\Gamma\).
+The step rule rewrites the command to
+\[
+c' \;=\; \mathsf{seq}\;\mathit{body}\;(\mathsf{loop}\;n\;\mathit{body})
+\]
+and leaves the environment alone.
+Checking \(c'\) at \(\Gamma\) checks the body, which returns \(\Gamma\), then checks \(\mathsf{loop}\;n\;\mathit{body}\) at that same \(\Gamma\).
+\Cref{def:loop} returns \(\Gamma\) for the smaller loop, because the body still returns \(\Gamma\).
+Sequencing two commands that each return \(\Gamma\) returns \(\Gamma\).
+Preservation therefore takes \(\Gamma' = \Gamma\) and keeps the original result context, which is \(\Gamma\).
+
+The same calculation is why the body must not be wrapped in a fresh block that restores an outer context.
+Under that older rule the body could return \(\Gamma_1 \neq \Gamma\) while the block returned \(\Gamma\), and the sequence above would be checked at \(\Gamma_1\) on its second command.
+The equality \cref{def:loop} demands would then be false for any body that assigns, and \cref{thm:pres} would have no proof.
+The rule that compiled is the one in which a block is transparent, assignments escape, and a loop may only reassign a name that \(\Gamma\) already contains at the same type.
+\texttt{loop\_fresh\_rejected} and \texttt{loop\_reassign\_typed} are the two sides of that equality.
+The fresh assignment grows \(\Gamma\) by \texttt{update}, so the body does not return \(\Gamma\) and the loop is \texttt{none}.
+The reassignment hits a name that \texttt{update} replaces in place, the context list is identical, and both the body and the loop return that list.
+The environment still gains a consed binding.
+\(\mathsf{models}\) survives because lookup reads the new head and the type is the one \(\Gamma\) already recorded.
+The zero bound is the other successor.
+\(\mathsf{loop}\;0\;\mathit{body}\) steps to \texttt{skip} without reading the body.
+Checking \texttt{skip} at \(\Gamma\) returns \(\Gamma\), and \cref{def:loop} has already required that result context to be \(\Gamma\).
+Progress for a typed loop is therefore immediate: the bound is either zero or a successor, and both rules return a command.
+No side condition is re-tested at the step, because the only condition, stability of \(\Gamma\), was discharged by checking.
+
+\section{Related work}
+\label{sec:related}
+
+Triton is an intermediate language and a compiler for tiled kernels~\cite{tillet2019triton}.
+The front end this paper models is the Python checker that sits in front of the MLIR dialect, and the dialect itself is an instance of the MLIR infrastructure~\cite{lattner2021mlir}.
+The paper does not formalize the dialect's rewrite pipeline.
+It formalizes the checks that decide whether a term is presented to that pipeline, and it uses the dialect's operand constraints only as an external test of the load and atomic mask rules.
+
+The type-safety statement is the syntactic one~\cite{wright1994syntactic,pierce2002tapl}.
+Lean~4 is the prover and the programming language in which the checkers are written as functions~\cite{demoura2021lean}.
+Writing the checkers as functions, rather than as an inductive relation plus a separate interpreter, is what lets \texttt{native\_decide} decide the examples and what forces the step relation to mention \texttt{storeOk} and \texttt{maskOk} by name.
+The cost is the one \cref{sec:proof-work} describes: value-redex preservation is \texttt{valTy\_pack}, and the proof effort moves to the side conditions and to control.
+
+CompCert shows that a compiler can be proved to preserve the semantics of a source language down to assembly~\cite{leroy2009compcert}.
+CakeML does the same for a functional language, with the compiler extracted from the prover~\cite{kumar2014cakeml}.
+Vellvm mechanizes the LLVM intermediate representation and a set of transformations~\cite{zhao2012vellvm}.
+Those developments are the standard this paper does not meet.
+There is no translation validation here, no memory model, and no claim that a typed Triton term lowers to a typed \texttt{tt} term.
+The load-mask gap in \cref{sec:gaps} is evidence that such a translation is not the identity on the Python checker: the checker returns a value for a term the dialect rejects.
+
+GPU kernel verifiers attack a different property.
+GPUVerify proves race-freedom and barrier divergence for a kernel language~\cite{betts2012gpuverify}.
+GKLEE explores concrete GPU executions for races and synchronization defects~\cite{li2012gklee}.
+Both assume a kernel that has already been accepted as a kernel.
+The present development stops at the front-end judgement those tools would take as given, and it stops short of the race freedom they prove.
+A race-freedom theorem for Triton would need the heap this step relation does not have.
+
+Mechanized semantics of domain-specific compiler IRs are closer in shape than the GPU verifiers are.
+The usual lesson, which this development repeats, is that the theorem is about the model.
+\Cref{sec:bounds} is that lesson for this model: the carrier, the missing heap, the loop restriction, and the five copy directions are part of the statement of type safety, not footnotes to it.
+
+\section{Conclusion}
+\label{sec:conc}
+
+Two Lean calculi cover the two front-end judgements a Triton-Ascend kernel meets before lowering.
+For the \texttt{tl.*} surface, type safety says that a typed command remains typed at its original result context, for a step relation whose value redexes pack the type the checker computed and whose stores and atomics do not describe a memory.
+For the cube and vector fragment, the same safety statement holds, and a typed copy or \texttt{mmad} is confined to the directions and the core the rules name.
+The birth-core walk used by the Python scope checker agrees with the second calculus on register programs and disagrees on a scalar assigned inside a core.
+The dtype checker agrees with the first calculus on program identifiers, on the two dot examples, and on a power-of-two range, and it disagrees on a non-boolean mask: the calculus rejects the mask, and \texttt{semantic.py} builds a \texttt{tt.load} or a \texttt{tt.atomic\_rmw} that the dialect verifier rejects.
+
+The obvious next theorems are the ones \cref{sec:bounds} excludes.
+A heap, even a single address space of cells, would make an unmasked load a partial operation and would make the load-mask rule a statement about which lanes are read.
+A proof that the Python checker accepts a term only if the calculus does, over a stated syntactic fragment rather than over nine examples, would replace \cref{sec:link} by an equivalence with explicit exceptions.
+A semantics of \texttt{nd2nz} and \texttt{mmad} as operations of a core, rather than as a direction table on one cell, would connect \cref{def:copy} to the split that currently erases the other core's operations after the front end has accepted them.
+None of those theorems is claimed here.
+
+\bibliography{references}
+\end{document}
