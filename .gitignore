@@ -1,0 +1,14 @@
+# Lake
+.lake/
+build/
+
+# Lean artifacts, if a build is run outside .lake
+*.olean
+*.ilean
+*.olean.hash
+*.trace
+
+# Editors
+.vscode/
+*.swp
+*~
