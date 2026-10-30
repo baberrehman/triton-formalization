@@ -8,6 +8,21 @@ build/
 *.olean.hash
 *.trace
 
+# LaTeX build from paper/Makefile
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.vtc
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+paper/main.pdf
+
 # Editors
 .vscode/
 *.swp
