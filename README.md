@@ -15,3 +15,5 @@ lake build
 **TAS** (`TAS/`) is a core calculus for the cube and vector fragment of Triton Language for Ascend. `semantics.md` states that development. It does not describe the `tl.*` surface, and the Triton development does not replace it.
 
 Pipeline acceptance between Triton-Ascend stages is a separate note: `docs/staged-compilation-contracts-triton-ascend.md`.
+
+`correspondence/check_link.py` runs `scope_check.py` and `TritonSemantic` on the Lean examples and records where the checkers disagree. The disagreements are stated in `semantics.md` and `triton-semantics.md`.

@@ -114,3 +114,11 @@ All of these are proved in `Triton/Safety.lean`. `lake build` checks them. There
 The integer in a value is not a tensor element, and `dot` does not multiply matrices. Stores and atomics do not describe a memory. The theorem does not rule out a data race, an unmasked out-of-bounds load, or a `view` that would be illegal because of contiguity. The scale operands of `dotScaled` are a pair of tensors of any shape. Libdevice functions other than the `Float1` list are `Unary.asm`: the dtype may change, the shape stays, and the external body is not given a semantics. `target_info` is host-side.
 
 TAS remains the model of `tla.scope.cube`, `tla.scope.simd`, and the copy directions. Pipeline acceptance between Triton-Ascend stages is `docs/staged-compilation-contracts-triton-ascend.md`.
+
+## Link to semantic.py
+
+`correspondence/check_link.py` calls `TritonSemantic` in `python/triton/language/semantic.py` on the examples in `Triton/Examples.lean`.
+
+Both accept `program_id(0)` as `int32` of rank 0 and reject axis 3. Both reject `dot` of `[32, 16]` with `[32, 16]` and accept `dot` of `[32, 16]` with `[16, 8]` at `f32 [32, 8]`. Both accept `arange(0, 128)` as `int32 [128]`.
+
+Two checks differ. `semantic.arange` requires a power-of-two range, so `arange(0, 3)` raises `ValueError`; `arange_non_pow2_typed` accepts it as `tensor i32 [3]`. `semantic.load` accepts an `f32` mask; `bad_mask_rejected` requires `bool`. The scalar-`if` check is `code_generator.py`, not `semantic.py`.

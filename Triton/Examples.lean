@@ -72,4 +72,9 @@ theorem loop_reassign_typed :
     (check withOffs (.loop 4 (.assign offs (.arange 0 128)))).isSome = true := by
   native_decide
 
+/-- `semantic.py` rejects this range because it is not a power of two. The calculus accepts it. -/
+theorem arange_non_pow2_typed :
+    infer [] (.arange 0 3) = some (.tensor .i32 [3]) := by
+  native_decide
+
 end Triton
